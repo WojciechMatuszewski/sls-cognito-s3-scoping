@@ -1,0 +1,165 @@
+service: sls-cognito-s3
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+
+package:
+  individually: true
+
+functions:
+  AutoVerifyUserFunction:
+    handler: auto-verify-user.handler
+    events:
+      - cognitoUserPool:
+          pool: UserPool
+          trigger: PreSignUp
+
+resources:
+  Resources:
+    AssetsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - "*"
+              AllowedMethods:
+                - GET
+                - HEAD
+                - PUT
+                - POST
+                - DELETE
+              # Adjust to your needs
+              AllowedOrigins:
+                - "*"
+
+    # https://www.serverless.com/framework/docs/providers/aws/events/cognito-user-pool#overriding-a-generated-user-pool
+    CognitoUserPoolUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        AutoVerifiedAttributes:
+          - email
+        UsernameAttributes:
+          - email
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 6
+            RequireLowercase: false
+            RequireNumbers: false
+            RequireSymbols: false
+            RequireUppercase: false
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        UserPoolId: !Ref CognitoUserPoolUserPool
+        GenerateSecret: false
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+        # Debug option
+        PreventUserExistenceErrors: LEGACY
+        SupportedIdentityProviders:
+          - COGNITO
+
+    IdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties:
+        AllowUnauthenticatedIdentities: false
+        CognitoIdentityProviders:
+          - ClientId: !Ref UserPoolClient
+            ProviderName: !Sub "cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolUserPool}"
+
+    AuthenticatedRole2:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Federated: cognito-identity.amazonaws.com
+              Action:
+                - sts:AssumeRoleWithWebIdentity
+              Condition:
+                StringEquals:
+                  cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+                ForAnyValue:StringLike:
+                  cognito-identity.amazonaws.com:amr: authenticated
+        Policies:
+          - PolicyName: "AllowS3"
+            PolicyDocument:
+              # Very important! This version adds the support for the policy variables.
+              # Without the version field, this policy will not behave as expected.
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                  Resource:
+                    - !GetAtt AssetsBucket.Arn
+                  Condition:
+                    StringLike:
+                      s3:prefix:
+                        # SLS framework thinks that the `${cognito-identity.amazonaws.com:sub}` is a reference and not a placeholder.
+                        - !Join [
+                            "",
+                            [
+                              # The `private` prefix is related to the frontend setup.
+                              # https://docs.amplify.aws/lib/storage/configureaccess/q/platform/js
+                              "private/",
+                              "$",
+                              "{cognito-identity.amazonaws.com:sub}/"
+                            ]
+                          ]
+                        - !Join [
+                            "",
+                            [
+                              "private/",
+                              "$",
+                              "{cognito-identity.amazonaws.com:sub}/*"
+                            ]
+                          ]
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                  Resource:
+                    - !Join [
+                        "",
+                        [
+                          !Sub "${AssetsBucket.Arn}/private/",
+                          "$",
+                          "{cognito-identity.amazonaws.com:sub}/*"
+                        ]
+                      ]
+
+    IdentityPoolRolesAttachment:
+      Type: AWS::Cognito::IdentityPoolRoleAttachment
+      Properties:
+        IdentityPoolId: !Ref IdentityPool
+        Roles:
+          authenticated: !GetAtt AuthenticatedRole2.Arn
+
+  Outputs:
+    UserPoolId:
+      Value: !Ref CognitoUserPoolUserPool
+    UserPoolClientId:
+      Value: !Ref UserPoolClient
+    IdentityPoolId:
+      Value: !Ref IdentityPool
+    BucketName:
+      Value: !Ref AssetsBucket
+
+custom:
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    keepNames: true
+    packager: npm
+
+plugins:
+  - serverless-esbuild
